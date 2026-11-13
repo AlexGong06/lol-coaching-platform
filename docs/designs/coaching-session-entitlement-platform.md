@@ -112,7 +112,7 @@ here and exactly what it costs.
   2026-11-13 it is gone. Four of the seven planned days had already elapsed when Alex
   decided the project would not lead the screening, and rather than compress a
   56-hour plan into three days the work is now ordered by dependency (see *Build
-  order*). The remaining estimate is **48.5 hours**, which is the sum of the eleven
+  order*). The remaining estimate is **49 hours**, which is the sum of the eleven
   phases and is stated as information rather than as a budget. No *scope* decision in
   this design rests on the clock any more; where sequencing still does — external lead
   time in Phase 0, deploy before features in Phase 2 — the reason is dependency and is
@@ -147,7 +147,7 @@ These were confirmed by research during the session and are load-bearing:
 | Removing a role does **not** disconnect a member already in a voice channel; "Disconnect Members when Roles Removed" is still an open Discord feature request | Confirmed by research 2026-11-13. No longer load-bearing here, but it is why the superseded role design needed a separate force-disconnect call |
 | Invite `temporary: true` ("grant temporary membership") removes the member when they disconnect from voice, unless a role was assigned. Community-documented, not in the official reference | **Deliberately unused.** A dropped connection mid-session would eject a paying student whose single-use invite is already spent |
 | `DELETE /invites/{code}` needs **Manage Channels** on the channel (or Manage Guild); `GET /channels/{id}/invites` the same | Two of the bot's three permissions |
-| `GET /guilds/{g}/members/{u}` requires the **`GUILD_MEMBERS` privileged intent**, which is a self-serve toggle in the developer portal below 100 guilds, not an approval | The bot needs Create Instant Invite, Manage Channels and that intent — and nothing else. Still no Manage Roles, no Move Members, and no ability to remove a member |
+| Reading guild membership (`GET /guilds/{g}/members/{u}`) would require the **`GUILD_MEMBERS` privileged intent** | **Deliberately not used.** The bot reads and writes invites on one channel and nothing else; it cannot see who is in the server. *(Alex, 2026-11-13: all member operations happen in the Discord app; the code does link generation and expiration.)* |
 | AWS SQS `DelaySeconds` caps at **15 minutes** | SQS cannot schedule anything for a session days out; the Postgres due-work table does the scheduling |
 | Discord member verification / rules screening leaves a joining member `pending` | A `pending` member cannot connect to voice, which looks exactly like the access system failing. **Decided: screening stays off** on the coaching server, since the invite is already single-use and window-bound, and a Phase 0 checklist item verifies it |
 | Stripe Checkout `expires_at` has a **30-minute minimum**, measured from session creation | The slot hold is 30 minutes and is created in the same transaction as the Checkout session |
@@ -480,7 +480,7 @@ expired-hold race moves out of it in both directions. Only `completed`,
 are terminal.
 
 **Entitlement states:** `pending` (created, window not yet open) → `open` (window
-current, a code should be live unless the student is already a guild member) →
+current, a code should be live) →
 `closed` (window ended with at least one code issued). Terminal branches: `voided`
 (never opened), `revoked` (cut short by refund or late cancellation),
 `expired_unfulfilled` (window ended and **no code was ever issued** — the only
@@ -535,17 +535,20 @@ and is fulfilled identically. A design that inferred attendance would have recor
 their attended session as a no-show and kept their money.
 
 **Removal-obligation states** (one row per closed or revoked entitlement, in
-`member_cleanup`): `queued` → `done` (Alex confirms removal in `/ops`) | `auto_resolved`
-(a reconcile pass reads guild membership and finds the student already gone).
+`member_cleanup`): `queued` → `done`, ticked by Alex in `/ops`.
 
 A row is written by the pass that writes the terminal entitlement state, in the same
 transaction, for **every** entitlement reaching `closed`, `revoked` or
 `expired_unfulfilled` — not only for consumed invites, since consumption is
-unobservable. Alex's stated workflow is to remove the student as the session ends, so in
-the normal case the next pass finds them gone and auto-resolves the row before it is
-ever seen. **The queue is therefore a safety net, not a to-do list**, and an uncleared
-row is a real signal rather than routine noise. `auto_resolved` is what makes it
-trustworthy: `done` alone is an operator self-report that nothing verifies.
+unobservable.
+
+**Stated limitation, not a gap to be closed later.** `done` is an operator
+self-report and **nothing verifies it**. The system cannot see who is in the server,
+by design, so this table records that an obligation existed and that Alex said it was
+discharged — nothing more. The round-1 reviewer flagged the unverified checkbox as a
+defect; the answer is that verification would require a membership read the bot
+deliberately does not have, so the limitation is published rather than engineered
+around. It is in the README's failure-modes table in these words.
 
 **Which definition of "open" is authoritative:** the **stored state** governs the
 reconciler's diff; the **timestamps** govern the transition that sets it. The worker
@@ -636,13 +639,17 @@ is all it can honestly claim, and why nothing commercial reads it.
 
 **The student who is already in the server.** Clicking an invite to a guild you are
 already in neither joins you nor consumes the invite, so this student's code would
-stay untouched all session. The booking page detects the case with one membership read
-(`GET /guilds/{g}/members/{u}`) when the window opens and shows **"You're already in
-the server — the voice channel is open now"** with a deep link to the channel instead
-of a join button. No invite is issued for them at all, which also means no code to
-delete and nothing to reconcile. Their entitlement still reaches `closed` and still
-queues a `member_cleanup` row, because fulfillment is time-based and the obligation is
-the same.
+stay untouched all session. **Nothing detects this and nothing needs to.** An invite is
+issued as normal; the student clicks it, Discord drops them into the server they are
+already in, and the code sits unused until the worker deletes it at window close. The
+booking page copy reads **"Join the session"** either way, and carries one line below
+it: *"Already in the server? The voice channel opens at your start time."* Fulfillment
+is time-based, so the unused code costs nothing and changes no state.
+
+In practice the case is uncommon, because Alex removes the student as the session ends,
+so a returning student is outside the server by their next booking. The design does not
+*depend* on that being true — it simply has no consequence either way, which is the
+point of making fulfillment time-based.
 
 **What happens if the student opens neither surface:** the window closes and the
 booking is `completed`, with no refund. See *Fulfillment is time, not attendance* —
@@ -655,8 +662,8 @@ case where the platform never issued a code.
   No code exists to join with, and the guard above means none can be minted outside the
   window either. This was Alex's stated core requirement. The qualifier is not a weasel:
   a guild member already inside needs no invite, which is why removal at session end is
-  part of the operating model and why `member_cleanup` auto-resolves against real guild
-  membership rather than trusting a checkbox.
+  part of the operating model rather than housekeeping — and why that removal is an
+  operator guarantee, not a platform one.
 - **Nobody new can join after the window closes.** The code is deleted, and it was
   single-use regardless.
 - **A refund or late cancellation inside an open window kills the credential** within
@@ -737,16 +744,14 @@ members the system had no record of — cannot arise, and
 entitlement state (`closed`, `revoked` or `expired_unfulfilled`) writes a
 `member_cleanup` row in state `queued` **in the same transaction**, unconditionally —
 consumption is unobservable, so the obligation is recorded for every entitlement rather
-than for the ones the system thinks were used. Each later pass reads guild membership
-for every `queued` row (`GET /guilds/{g}/members/{u}`, 404 ⇒ gone) and flips it to
-`auto_resolved`. Alex clears the remainder from `/ops`.
+than for the ones the system thinks were used. The pass does nothing further with it: Alex
+clears the row in `/ops` after removing the student in Discord.
 
-Given Alex removes the student as the session ends, the normal path is that the next
-pass auto-resolves the row within ~30 seconds and nobody ever looks at it. Desired
-state is recorded, divergence is detected and dated against real guild membership
-rather than an operator checkbox, and the action belongs to a person — a defensible
-shape for a system whose last mile is outside its authority, and the part worth
-describing in the README rather than hiding.
+**The reconciler never reads or touches a member.** It converges invite codes and
+stops. The obligation is recorded and dated, the discharge is asserted by a person, and
+the system does not pretend to know the difference — a defensible shape for a last mile
+that is outside its authority on purpose, and the part worth describing in the README
+rather than hiding.
 
 ### Cancellation, refunds, and no-shows
 
@@ -818,12 +823,10 @@ scheduled sessions.
   - **Confirm removal** — marks a `member_cleanup` row `done`. It performs no Discord
     call to remove anyone, which is the whole point: the platform records the
     obligation and its discharge and never acts on a member. **It does verify before
-    accepting**, with one membership read: if the student is still in the guild the
-    control refuses and says so, because `done` as a bare operator self-report would
-    assert exactly the fact the queue exists to establish. The ordinary path is that no
-    confirmation is needed at all — a pass reads membership, finds the student gone and
-    writes `auto_resolved` — so a `done` row means Alex overrode a disagreement and is
-    worth seeing as such.
+    accepting** nothing, and that is explicit: the bot cannot see who is in the server,
+    so `done` is Alex's word for it. `/ops` labels the column *"removal confirmed by
+    operator"* rather than *"removed"*, so the dashboard never overstates what the
+    system knows.
 
   No review-marking controls exist, because fulfillment is window closure for every
   SKU. The page displays a student's Discord username and the Stripe payment-intent
@@ -884,7 +887,7 @@ sentence — it touches only codes it issued — and a last mile it hands to a p
 with a dated record, which is a more defensible system than one that ejects people
 using a Discord behavior nobody has tested.
 
-## Build order (dependency-ordered, 48.5 hours)
+## Build order (dependency-ordered, 49 hours)
 
 No dates. The original seven-day hour-indexed table, its two failure-triggered gates,
 its noon freeze and its five-item cut list were all artifacts of a deadline that no
@@ -893,10 +896,10 @@ does not. What replaces them is an order: each phase depends on the one before i
 nothing is scheduled against a clock. The hour figures are estimates for sequencing,
 not a budget to defend.
 
-**Phase totals:** 3 + 4 + 1 + 5 + 7.5 + 5 + 10 + 2 + 1 + 4 + 6 = **48.5 hours**. The
+**Phase totals:** 3 + 4 + 1 + 5 + 7.5 + 5.5 + 10 + 2 + 1 + 4 + 6 = **49.0 hours**. The
 access work inside that went from **14.5 hours to 7.5** with the role design's removal,
-then back up by 1.0 for the membership read and the `member_cleanup` queue that the
-round-1 review showed the invite model needs — **8.5 against the role design's 14.5**:
+then back up by 0.5 for the `member_cleanup` queue the round-1 review showed the invite
+model needs — **8.0 against the role design's 14.5**:
 
 | Item | Role design | Invite design |
 |---|---:|---:|
@@ -905,10 +908,9 @@ round-1 review showed the invite model needs — **8.5 against the role design's
 | Reconciler core and diff | 5.0 | 3.0 |
 | Revoke (was role removal + force-disconnect + 403 handling) | 2.0 | 0.5 |
 | Invite fallback path | 1.0 | 0 (it is the primary path now) |
-| Membership read (`GUILD_MEMBERS` intent, already-a-member path, auto-resolve) | 0 | 1.0 |
-| `member_cleanup` queue and its `/ops` surface | 0 | 1.0 |
+| `member_cleanup` queue and its `/ops` surface | 0 | 0.5 |
 | Access-related mandatory tests | 3.0 | 2.5 |
-| **Total** | **14.5** | **8.5** |
+| **Total** | **14.5** | **8.0** |
 
 **Phase 0 — external lead time, started first because waiting is the cost.**
 Transactional email provider with sender-domain verification (DNS propagation runs
@@ -946,7 +948,7 @@ real money, so it is built when nothing else is in flight. ~7.5 h.
 
 **Phase 5 — access.** Discord application and bot with Create Instant Invite and Manage
 Channels, Discord OAuth, the reconciler, invite issue and delete, `access_events`, and
-the `member_cleanup` queue. ~5 h. *(Phase 4 before Phase 5 deliberately: an entitlement
+the `member_cleanup` queue. ~5.5 h. *(Phase 4 before Phase 5 deliberately: an entitlement
 that does not exist cannot be reconciled.)*
 
 **Phase 6 — the edges that make it a product.** Cancellation and refunds across all
@@ -1034,10 +1036,12 @@ waits out a 31-minute hold expiry or a 60-second poll interval.
    resolves to `cancelled_refunded` / `expired_unfulfilled` **with a refund due-work row
    written by the same pass**, with no operator action. This is the money assertion of
    the 2026-11-13 amendment and it is the test that would have caught the no-show bug.
-10. **The already-a-member path is fulfilled, not failed.** With the membership read
-   returning 200 for the student, the window opens, **no invite is created**, the
-   booking still reaches `completed` and a `member_cleanup` row is still queued. Run
-   against a double returning 404 as the control, where a code *is* created.
+10. **An unused code changes nothing.** A code is issued, never clicked, and the window
+   closes: the booking reaches `completed`, the entitlement `closed`, the code is
+   deleted, a `member_cleanup` row is `queued`, and **no refund row is written**. This
+   is the assertion that keeps the returning-student case safe without the system
+   having to recognize it — their session looks exactly like this one and settles the
+   same way.
 
 ## Open Questions
 
@@ -1094,8 +1098,8 @@ waits out a 31-minute hold expiry or a 60-second poll interval.
   dead: the rehearsal student cannot test it, since clicking an invite to a guild they
   are already in neither joins them nor fails visibly, so Alex retries the captured
   code from a third account. The student is still a member of the server afterward and
-  a `member_cleanup` row is in `/ops` — **that is a pass, not a failure** — which
-  Alex then clears by removing them, confirming the row auto-resolves.
+  a `member_cleanup` row is in `/ops` — **that is a pass, not a failure** — which Alex
+  then discharges by removing them in Discord and ticking the row.
 - All ten mandatory tests green in CI.
 - The live link works and the README stands alone without it.
 - `/ops` shows a correct, complete picture of every booking, every failed action, and
@@ -1126,12 +1130,12 @@ only AWS service in the critical path.
 - **A dedicated Discord server** for coaching, not Alex's community server. Hard
   requirement, for the reason in *Access model*.
 - Discord application with OAuth scopes **`identify`, `email`** configured; bot invited
-  with **Create Instant Invite** and **Manage Channels**, plus the **`GUILD_MEMBERS`
-  privileged intent** toggled on in the developer portal (self-serve below 100 guilds).
-  The intent is what lets the reconciler read guild membership, which the already-a-member
-  path and `member_cleanup` auto-resolve both depend on. Still no Manage Roles, no Move
-  Members, no Kick Members, and no role-hierarchy ordering to get right — the bot can
-  read who is in the server and manage invites on one channel, and nothing else.
+  with **Create Instant Invite** and **Manage Channels**, and nothing else. No Manage
+  Roles, no Move Members, no Kick Members, no privileged intents, and no
+  role-hierarchy ordering to get right. The bot can create, list and delete invites on
+  one channel. **It cannot see who is in the server and cannot remove anyone**, which
+  is the scope Alex set on 2026-11-13 and is worth stating in the README as a
+  deliberate boundary rather than a missing feature.
 - Discord **member verification / rules screening disabled**, or the `pending` state
   handled explicitly: a `pending` member cannot connect to voice, which would look
   exactly like the access system failing.
@@ -1172,12 +1176,12 @@ Throwaway Discord server. One voice channel. Create an invite through the API wi
 4. **Create one more with `max_age: 60` and let it lapse unused.** Confirm it
    disappears from `GET /channels/{id}/invites` on its own. That self-expiry is the
    safety net mandatory test 7 depends on.
-5. **Click an invite from an account that is already in the server.** Confirm it does
-   not re-join you and, in `GET /channels/{id}/invites`, confirm whether `uses`
-   increments. Mandatory test 10 and the already-a-member branch of the booking page
-   both rest on the answer, and it is the one step whose result could still change the
-   design: if `uses` *does* increment, the membership read becomes optional rather
-   than load-bearing.
+5. **Click an invite from an account that is already in the server.** Confirm what the
+   student actually sees — whether Discord drops you straight into the server, shows a
+   confirmation, or errors. The booking page's "Already in the server?" line should
+   describe whatever really happens, and this is the only way to know. Nothing in the
+   design depends on the answer, which is the result of making fulfillment
+   time-based.
 6. **Create one with `max_age: 0` and watch it never expire.** Ten seconds, and it is
    the fastest way to internalize why the create path must refuse a non-positive
    `max_age` instead of passing it through. That guard is mandatory test 4's negative
