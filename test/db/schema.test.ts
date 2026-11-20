@@ -108,10 +108,44 @@ describe('reservations: overlap, the gap, and blackouts', () => {
     });
   });
 
-  test('a backwards range is refused by a check constraint', async () => {
-    await assert.rejects(
-      () => reserve('15:00', '14:00'),
-      (err: unknown) => (err as { code?: string }).code === '23514',
-    );
+  // Every malformed range must fail the SAME way. Before the trigger guarded this, the
+  // error code depended on how backwards the range was: a BEFORE trigger runs ahead of
+  // every CHECK, so a range backwards by more than the 15-minute gap died inside
+  // tstzrange() as 22000, while one backwards by less than the gap shifted into a valid
+  // range and fell through to the CHECK as 23514. Calling code cannot catch both.
+  describe('a malformed range is refused with one error code', () => {
+    const isCheckViolation = (err: unknown) => (err as { code?: string }).code === '23514';
+
+    test('backwards by more than the 15-minute gap', async () => {
+      await assert.rejects(() => reserve('15:00', '14:00'), isCheckViolation);
+    });
+
+    test('backwards by less than the 15-minute gap', async () => {
+      await assert.rejects(() => reserve('15:00', '14:50'), isCheckViolation);
+    });
+
+    test('zero-length', async () => {
+      await assert.rejects(() => reserve('15:00', '15:00'), isCheckViolation);
+    });
+  });
+
+  test('a NULL reserved range cannot slip past the exclusion constraint', async () => {
+    // `&&` against NULL yields NULL, not true, so a NULL-reserved row would be
+    // invisible to the constraint and double-book its time. The trigger always fills
+    // the column, so this disables it to reach the state a COPY or a replication tool
+    // could otherwise produce. NOT NULL is what actually holds the line.
+    await db.query('ALTER TABLE reservations DISABLE TRIGGER reservations_reserved');
+    try {
+      await assert.rejects(
+        () => db.query(
+          `INSERT INTO reservations (kind, starts_at, ends_at, reserved)
+           VALUES ('booking', $1, $2, NULL)`,
+          [H('14:00'), H('15:00')],
+        ),
+        (err: unknown) => (err as { code?: string }).code === '23502',
+      );
+    } finally {
+      await db.query('ALTER TABLE reservations ENABLE TRIGGER reservations_reserved');
+    }
   });
 });

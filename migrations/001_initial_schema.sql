@@ -25,7 +25,13 @@ CREATE TABLE reservations (
   -- IMMUTABLE, and `timestamptz + interval` is only STABLE (adding '1 day' and
   -- '24 hours' differ across a DST boundary). The naive inline form fails at
   -- migration time with "functions in index expression must be marked IMMUTABLE".
-  reserved    tstzrange,
+  --
+  -- NOT NULL is load-bearing, not tidiness: `&&` against NULL yields NULL rather than
+  -- true, so a row with a NULL `reserved` is invisible to the exclusion constraint and
+  -- double-books its time silently. The trigger always populates it, but a COPY, a
+  -- replication tool or one ALTER TABLE ... DISABLE TRIGGER bypasses the trigger and
+  -- would otherwise take the system's central invariant with it.
+  reserved    tstzrange  NOT NULL,
 
   -- Whether this row currently occupies its time. The booking state machine is the
   -- only thing that flips it for kind='booking'; blackouts are inserted true and
@@ -40,6 +46,16 @@ CREATE TABLE reservations (
 
 CREATE FUNCTION reservations_set_reserved() RETURNS trigger AS $$
 BEGIN
+  -- Guard before building the range. A BEFORE trigger runs ahead of every CHECK, so
+  -- without this a backwards range fails in one of two ways depending on HOW backwards
+  -- it is: by more than the gap and tstzrange() itself raises 22000 from inside this
+  -- function; by less than the gap and the shifted range is still valid, so the row
+  -- reaches reservations_forward and raises 23514. Callers cannot catch one code.
+  IF NEW.ends_at <= NEW.starts_at THEN
+    RAISE EXCEPTION 'reservation must end after it starts: % to %', NEW.starts_at, NEW.ends_at
+      USING ERRCODE = 'check_violation', CONSTRAINT = 'reservations_forward';
+  END IF;
+
   -- The 15-minute inter-session gap lives INSIDE the reserved range, so the database
   -- enforces it. Book 2:00-3:00 and 2:00-3:15 is reserved; nothing may start before
   -- 3:15. This keeps a departing student out of the next session without depending
