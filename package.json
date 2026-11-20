@@ -7,9 +7,9 @@
     "node": ">=22.18"
   },
   "scripts": {
-    "migrate": "node --experimental-strip-types scripts/migrate.ts",
+    "migrate": "node --env-file-if-exists=.env --experimental-strip-types scripts/migrate.ts",
     "test:unit": "node --test --experimental-strip-types \"test/unit/*.test.ts\"",
-    "test:db": "node --test --test-concurrency=1 --experimental-strip-types \"test/db/*.test.ts\"",
+    "test:db": "node --env-file-if-exists=.env --test --test-concurrency=1 --experimental-strip-types \"test/db/*.test.ts\"",
     "test": "npm run test:unit && npm run test:db",
     "db:up": "docker compose up -d db",
     "db:down": "docker compose down"

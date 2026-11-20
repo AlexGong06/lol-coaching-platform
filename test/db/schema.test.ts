@@ -2,8 +2,10 @@
 // prove: that the exclusion constraint compiles at all, and that it refuses what the
 // design claims it refuses.
 //
-// Needs DATABASE_URL. Any PostgreSQL 16+ will do:
-//   docker compose up -d db          (or)   brew install postgresql@16
+// Needs DATABASE_URL, which `npm run test:db` reads from .env if one exists. Any
+// PostgreSQL 16+ will do:
+//   cp .env.example .env
+//   npm run db:up                    (or)   brew install postgresql@16
 //   npm run migrate && npm run test:db
 import { test, describe, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -28,7 +30,11 @@ const isOverlapViolation = (err: unknown) =>
 
 describe('reservations: overlap, the gap, and blackouts', () => {
   before(async () => {
-    assert.ok(url, 'DATABASE_URL must be set');
+    assert.ok(
+      url,
+      'DATABASE_URL is unset, and no .env was found for the test script to read.\n' +
+        '  cp .env.example .env     (then `npm run db:up` if Postgres is not running)',
+    );
     await db.connect();
     const { rows } = await db.query(
       `SELECT 1 FROM information_schema.tables WHERE table_name = 'reservations'`,

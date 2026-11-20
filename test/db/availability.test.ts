@@ -4,7 +4,8 @@
 // real database can: that `reserved` comes back carrying the gap the trigger folded in,
 // and that search and the exclusion constraint agree about which rows occupy time.
 //
-// Needs DATABASE_URL. See test/db/schema.test.ts for how to get one.
+// Needs DATABASE_URL, read from .env by `npm run test:db`. See test/db/schema.test.ts
+// for how to get one.
 import { test, describe, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import pg from 'pg';
@@ -36,7 +37,11 @@ async function reserve(startIso: string, endIso: string, kind = 'booking') {
 
 describe('availability search against the database', () => {
   before(async () => {
-    assert.ok(url, 'DATABASE_URL must be set');
+    assert.ok(
+      url,
+      'DATABASE_URL is unset, and no .env was found for the test script to read.\n' +
+        '  cp .env.example .env     (then `npm run db:up` if Postgres is not running)',
+    );
     await db.connect();
     const { rows } = await db.query(
       `SELECT 1 FROM information_schema.tables WHERE table_name = 'availability_rules'`,
