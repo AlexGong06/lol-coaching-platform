@@ -22,10 +22,8 @@ import { type Interval, MINUTE_MS, isValidTimeZone } from '../time.ts';
 /** A search may not ask for more than this, so one request cannot scan a year. */
 export const MAX_WINDOW_DAYS = 60;
 
-export interface ApiResult {
-  status: number;
-  body: unknown;
-}
+export type { ApiResult } from './result.ts';
+import type { ApiResult } from './result.ts';
 
 type Query = Record<string, string | undefined>;
 

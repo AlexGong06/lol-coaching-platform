@@ -123,7 +123,7 @@ beforeEach(async () => {
 
 describe('createHold against the database', () => {
   test('a hold reserves the slot, stores the session, and queues its own expiry', async () => {
-    const provider = new FakePaymentProvider();
+    const provider = new FakePaymentProvider({ now: NOW });
     const hold = await createHold(db, provider, INPUT, NOW);
 
     const { rows: bookings } = await db.query(
@@ -156,7 +156,7 @@ describe('createHold against the database', () => {
   });
 
   test('the reserved range carries the gap, so the next offer is 19:15', async () => {
-    await createHold(db, new FakePaymentProvider(), INPUT, NOW);
+    await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     const offered = await offeredStarts();
 
     assert.ok(!offered.includes(START), 'the booked hour is gone');
@@ -165,17 +165,17 @@ describe('createHold against the database', () => {
   });
 
   test('booking the same slot twice over sees a stale calendar, not a crash', async () => {
-    await createHold(db, new FakePaymentProvider(), INPUT, NOW);
+    await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     // Sequential, so the first hold is committed and visible: this is the common case,
     // a student on a tab that was open when someone else booked.
     await assert.rejects(
-      () => createHold(db, new FakePaymentProvider(), INPUT, NOW),
+      () => createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW),
       (err: unknown) => err instanceof HoldError && err.code === 'not_offered',
     );
   });
 
   test('a provider failure leaves nothing behind and the slot is offered again', async () => {
-    const provider = new FakePaymentProvider({ failWith: 'stripe unreachable' });
+    const provider = new FakePaymentProvider({ now: NOW, failWith: 'stripe unreachable' });
     await assert.rejects(
       () => createHold(db, provider, INPUT, NOW),
       (err: unknown) => err instanceof HoldError && err.code === 'provider_failed',
@@ -199,7 +199,7 @@ describe('createHold against the database', () => {
 
     // The loser passes the offered check (nothing is committed yet) and then blocks on
     // the exclusion constraint against a row it cannot see.
-    const loser = createHold(rival, new FakePaymentProvider(), INPUT, NOW);
+    const loser = createHold(rival, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     await waitUntilBlocked('INSERT INTO reservations');
 
     gated.release();
@@ -223,7 +223,7 @@ describe('createHold against the database', () => {
 
 describe('the hold-expiry sweeper', () => {
   test('a lapsed hold is released and the hour goes back on sale', async () => {
-    const hold = await createHold(db, new FakePaymentProvider(), INPUT, NOW);
+    const hold = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     const after = new Date(hold.holdExpiresAt.getTime() + 1000);
 
     const outcomes = await sweepDueWork(db, after);
@@ -248,7 +248,7 @@ describe('the hold-expiry sweeper', () => {
   });
 
   test('a hold paid in the last second is not released', async () => {
-    const hold = await createHold(db, new FakePaymentProvider(), INPUT, NOW);
+    const hold = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     // Stands in for the webhook landing first. The sweeper must notice and stand down.
     await db.query(`UPDATE bookings SET state = 'paid' WHERE id = $1`, [hold.bookingId]);
 
@@ -268,7 +268,7 @@ describe('the hold-expiry sweeper', () => {
   });
 
   test('work that is not due yet is left alone', async () => {
-    const hold = await createHold(db, new FakePaymentProvider(), INPUT, NOW);
+    const hold = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     const outcomes = await sweepDueWork(db, new Date(hold.holdExpiresAt.getTime() - 1000));
     assert.deepEqual(outcomes, []);
     const { rows } = await db.query('SELECT state FROM bookings WHERE id = $1', [hold.bookingId]);
@@ -276,7 +276,7 @@ describe('the hold-expiry sweeper', () => {
   });
 
   test('work of a kind this poller cannot run is left queued, not marked done', async () => {
-    const hold = await createHold(db, new FakePaymentProvider(), INPUT, NOW);
+    const hold = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     await db.query(
       `INSERT INTO due_work (kind, booking_id, due_at) VALUES ('window_open', $1, $2)`,
       [hold.bookingId, NOW.toISOString()],
@@ -292,7 +292,7 @@ describe('the hold-expiry sweeper', () => {
   });
 
   test('a booking cannot be queued for the same expiry twice', async () => {
-    const hold = await createHold(db, new FakePaymentProvider(), INPUT, NOW);
+    const hold = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     await assert.rejects(
       () => db.query(
         `INSERT INTO due_work (kind, booking_id, due_at) VALUES ('hold_expiry', $1, now())`,
@@ -303,7 +303,7 @@ describe('the hold-expiry sweeper', () => {
   });
 
   test('a second poller skips a row the first is already running', async () => {
-    const hold = await createHold(db, new FakePaymentProvider(), INPUT, NOW);
+    const hold = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     const after = new Date(hold.holdExpiresAt.getTime() + 1000);
 
     // Stand in for the first poller mid-handler: claimed, locked, not yet committed.

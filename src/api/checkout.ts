@@ -22,10 +22,8 @@ import type { Queryable } from '../db/queries.ts';
 import type { PaymentProvider } from '../payments.ts';
 import { SKU_NAMES } from '../skus.ts';
 
-export interface ApiResult {
-  status: number;
-  body: unknown;
-}
+export type { ApiResult } from './result.ts';
+import type { ApiResult } from './result.ts';
 
 const REQUIRED = [
   'sku',
