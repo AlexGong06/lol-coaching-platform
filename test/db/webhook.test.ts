@@ -141,7 +141,7 @@ describe('a paid booking, end to end', () => {
       `UPDATE due_work SET done_at = NULL WHERE booking_id = $1 AND kind = 'hold_expiry'`,
       [hold.bookingId],
     );
-    const outcomes = await sweepDueWork(db, new Date(hold.holdExpiresAt.getTime() + 1000));
+    const outcomes = await sweepDueWork(db, null, new Date(hold.holdExpiresAt.getTime() + 1000));
 
     assert.equal(outcomes[0]?.result, 'superseded');
     assert.deepEqual(await stateOf(hold.bookingId), { state: 'paid', holds_slot: true });
@@ -187,7 +187,7 @@ describe('a payment that lands after the hold expired', () => {
   test('the slot is reclaimed when nobody else took it', async () => {
     const hold = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     const afterExpiry = new Date(hold.holdExpiresAt.getTime() + 1000);
-    assert.equal((await sweepDueWork(db, afterExpiry))[0]?.result, 'released');
+    assert.equal((await sweepDueWork(db, null, afterExpiry))[0]?.result, 'released');
     assert.deepEqual(await stateOf(hold.bookingId), {
       state: 'expired_hold', holds_slot: false,
     });
@@ -203,7 +203,7 @@ describe('a payment that lands after the hold expired', () => {
   test('the exclusion constraint is what refuses a resold hour', async () => {
     const first = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     const afterExpiry = new Date(first.holdExpiresAt.getTime() + 1000);
-    await sweepDueWork(db, afterExpiry);
+    await sweepDueWork(db, null, afterExpiry);
 
     // The hour went back on sale and a second student bought it.
     const second = await createHold(

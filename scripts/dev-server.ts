@@ -25,6 +25,7 @@ import { handleCheckout } from '../src/api/checkout.ts';
 import { HANDLED_EVENT_TYPES, handleWebhook } from '../src/api/webhook.ts';
 import { StripePaymentProvider } from '../src/stripe/provider.ts';
 import { StripeWebhookVerifier } from '../src/stripe/verifier.ts';
+import { DiscordInviteProvider } from '../src/discord/invites.ts';
 import { sweepDueWork } from '../src/worker/sweep.ts';
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -55,6 +56,16 @@ const provider =
 
 const verifier = webhookSecret === undefined ? null : new StripeWebhookVerifier(webhookSecret);
 
+const botToken = process.env.DISCORD_BOT_TOKEN;
+const inviteChannelId = process.env.DISCORD_INVITE_CHANNEL_ID;
+
+// Null unless BOTH are set. A sweep then leaves window rows queued with the reason in
+// due_work.last_error, rather than claiming them and marking work done that never ran.
+const invites =
+  botToken === undefined || inviteChannelId === undefined
+    ? null
+    : new DiscordInviteProvider({ botToken, channelId: inviteChannelId });
+
 /** The one command that produces a working signing secret, built from what we handle. */
 const LISTEN_COMMAND =
   `stripe listen --events ${HANDLED_EVENT_TYPES.join(',')}` +
@@ -80,6 +91,7 @@ const ROUTES = [
   'POST /api/stripe/webhook',
   'POST /api/dev/sweep          run one due-work pass now',
   'GET  /api/dev/bookings       the 20 most recent bookings and their state',
+  'GET  /api/dev/invites        issued access codes (live credentials: dev only)',
 ];
 
 async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
@@ -139,7 +151,7 @@ async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promi
   }
 
   if (method === 'POST' && path === '/api/dev/sweep') {
-    const outcomes = await sweepDueWork(db, new Date());
+    const outcomes = await sweepDueWork(db, invites, new Date());
     send(res, 200, { ran: outcomes.length, outcomes });
     return;
   }
@@ -158,6 +170,27 @@ async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promi
         LIMIT 20`,
     );
     send(res, 200, { bookings: rows });
+    return;
+  }
+
+  if (method === 'GET' && path === '/api/dev/invites') {
+    // The codes are not returned by the sweeper or printed in its log lines: a live
+    // credential has no business in stdout on every pass. Until the student-facing
+    // delivery exists, this endpoint is how a code is read back for a manual test.
+    const { rows } = await db.query(
+      `SELECT ai.code, ai.state, ai.max_age_seconds, ai.expires_at,
+              e.booking_id, e.state AS entitlement_state, e.starts_at, e.ends_at
+         FROM access_invites ai
+         JOIN entitlements e ON e.id = ai.entitlement_id
+        ORDER BY ai.id DESC
+        LIMIT 20`,
+    );
+    send(res, 200, {
+      invites: rows.map((row) => {
+        const r = row as { code: string };
+        return { ...r, url: `https://discord.gg/${r.code}` };
+      }),
+    });
     return;
   }
 
@@ -189,6 +222,9 @@ server.listen(PORT, HOST, () => {
   for (const line of ROUTES) console.log(`  ${line}`);
   if (provider === null) console.log('  ! STRIPE_SECRET_KEY unset: /api/checkout returns 503');
   if (verifier === null) console.log('  ! STRIPE_WEBHOOK_SECRET unset: webhook returns 503');
+  if (invites === null) {
+    console.log('  ! DISCORD_BOT_TOKEN/DISCORD_INVITE_CHANNEL_ID unset: window work stays queued');
+  }
   console.log(`\nto receive webhooks:\n  ${LISTEN_COMMAND}`);
 });
 

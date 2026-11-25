@@ -19,28 +19,52 @@
 // error, and leaves `done_at` NULL so the next pass retries it.
 
 import type { Queryable } from '../db/queries.ts';
+import type { InviteProvider } from '../access.ts';
 import { bookingTransition, holdsSlot, type BookingState } from '../states.ts';
+import { closeWindow, openWindow } from './window.ts';
 
 /**
  * Kinds this poller knows how to run. Rows of any other kind are left unclaimed rather
- * than claimed and marked done, so wiring up `window_open` later finds its backlog
- * waiting instead of silently discharged.
+ * than claimed and marked done, so wiring up `upload_grant_close` later finds its
+ * backlog waiting instead of silently discharged.
  */
-export const HANDLED_KINDS = ['hold_expiry'] as const;
+export const HANDLED_KINDS = ['hold_expiry', 'window_open', 'window_close'] as const;
 export type HandledKind = (typeof HANDLED_KINDS)[number];
 
 /** Rows per pass. Bounded so one pass cannot run forever on a growing queue. */
 export const DEFAULT_BATCH = 20;
 
+/**
+ * What a handler did. One vocabulary across all three kinds, because the caller logs
+ * these and a test asserts them:
+ *
+ *   released      an unpaid hold lapsed and the slot went back on sale
+ *   opened        a window started and an access code was issued
+ *   window_over   window_open ran after the session had already ended; no code minted
+ *   closed        a window ended with a code having been issued; nothing is owed
+ *   unfulfilled   a window ended with no code ever issued; a manual refund is owed
+ *   superseded    something had already acted (the webhook won the race, or cancelled)
+ *   failed        the handler threw; the row stays queued and the next pass retries
+ */
+export type SweepResult =
+  | 'released'
+  | 'opened'
+  | 'window_over'
+  | 'closed'
+  | 'unfulfilled'
+  | 'superseded'
+  | 'failed';
+
 export interface SweepOutcome {
   workId: string;
   kind: HandledKind;
   bookingId: string | null;
+  result: SweepResult;
   /**
-   * `released` the slot went back on sale, `superseded` the booking had already moved
-   * on (the webhook won the race), `failed` the handler threw and the row stays queued.
+   * Why, when the result alone does not say. Never the invite code: that is a live
+   * credential, and this line is what a caller prints to stdout on every pass.
    */
-  result: 'released' | 'superseded' | 'failed';
+  note?: string;
   error?: string;
 }
 
@@ -77,6 +101,7 @@ async function rollback(db: Queryable): Promise<void> {
  */
 export async function sweepDueWork(
   db: Queryable,
+  invites: InviteProvider | null,
   now: Date,
   batch = DEFAULT_BATCH,
 ): Promise<SweepOutcome[]> {
@@ -86,7 +111,7 @@ export async function sweepDueWork(
   const seen: string[] = [];
 
   for (let i = 0; i < batch; i += 1) {
-    const outcome = await runNext(db, now, seen);
+    const outcome = await runNext(db, invites, now, seen);
     if (outcome === null) break;
     seen.push(outcome.workId);
     outcomes.push(outcome);
@@ -95,7 +120,12 @@ export async function sweepDueWork(
   return outcomes;
 }
 
-async function runNext(db: Queryable, now: Date, seen: string[]): Promise<SweepOutcome | null> {
+async function runNext(
+  db: Queryable,
+  invites: InviteProvider | null,
+  now: Date,
+  seen: string[],
+): Promise<SweepOutcome | null> {
   await db.query('BEGIN');
   let work: WorkRow | undefined;
 
@@ -119,9 +149,7 @@ async function runNext(db: Queryable, now: Date, seen: string[]): Promise<SweepO
       return null;
     }
 
-    // Only one handled kind so far; `work.kind` is typed to it, so adding `window_open`
-    // to HANDLED_KINDS turns this into a type error until it is dispatched.
-    const result = await expireHold(db, work, now);
+    const { result, note } = await dispatch(db, invites, work, now);
 
     await db.query(
       `UPDATE due_work
@@ -131,7 +159,13 @@ async function runNext(db: Queryable, now: Date, seen: string[]): Promise<SweepO
     );
     await db.query('COMMIT');
 
-    return { workId: work.id, kind: work.kind, bookingId: work.booking_id, result };
+    return {
+      workId: work.id,
+      kind: work.kind,
+      bookingId: work.booking_id,
+      result,
+      ...(note === undefined ? {} : { note }),
+    };
   } catch (err) {
     await rollback(db);
     // The SELECT itself failed, so there is no row to blame or record against.
@@ -157,6 +191,49 @@ async function runNext(db: Queryable, now: Date, seen: string[]): Promise<SweepO
 }
 
 /**
+ * Send a claimed row to its handler.
+ *
+ * The switch is exhaustive over HandledKind, so adding a kind to HANDLED_KINDS is a
+ * type error until it is dispatched here. That is the point: a kind that is claimable
+ * but unhandled would be marked done without its work being run.
+ */
+async function dispatch(
+  db: Queryable,
+  invites: InviteProvider | null,
+  work: WorkRow,
+  now: Date,
+): Promise<{ result: SweepResult; note?: string }> {
+  // Every handled kind acts on a booking. Checked once here rather than in each handler.
+  if (work.booking_id === null) throw new Error(`${work.kind} work row has no booking`);
+
+  switch (work.kind) {
+    case 'hold_expiry':
+      return { result: await expireHold(db, work.booking_id, now) };
+
+    case 'window_open': {
+      // Left queued rather than discharged. A window whose code cannot be minted has
+      // not been served, and the next pass with a token configured will still find it.
+      if (invites === null) throw new Error('DISCORD_BOT_TOKEN is unset, so no code can be issued');
+      const outcome = await openWindow(db, invites, work.booking_id, now);
+      return outcome.result === 'superseded'
+        ? { result: 'superseded', note: outcome.note }
+        : { result: outcome.result };
+    }
+
+    case 'window_close': {
+      // Unlike window_open this could proceed without Discord, since the code has
+      // already expired by itself. It still refuses: closing without even attempting
+      // the delete would record `deleted` work that never happened.
+      if (invites === null) throw new Error('DISCORD_BOT_TOKEN is unset, so no code can be revoked');
+      const outcome = await closeWindow(db, invites, work.booking_id, now);
+      return outcome.result === 'superseded'
+        ? { result: 'superseded', note: outcome.note }
+        : { result: outcome.result, note: `invite ${outcome.inviteRemoval}` };
+    }
+  }
+}
+
+/**
  * Release an unpaid hold.
  *
  * The lock on the booking is what makes this safe. Between this poller claiming the
@@ -167,17 +244,15 @@ async function runNext(db: Queryable, now: Date, seen: string[]): Promise<SweepO
  */
 async function expireHold(
   db: Queryable,
-  work: WorkRow,
+  bookingId: string,
   now: Date,
 ): Promise<'released' | 'superseded'> {
-  if (work.booking_id === null) throw new Error('hold_expiry work row has no booking');
-
   const { rows } = await db.query(
     'SELECT id, state, reservation_id FROM bookings WHERE id = $1 FOR UPDATE',
-    [work.booking_id],
+    [bookingId],
   );
   const booking = firstRow<BookingRow>(rows);
-  if (booking === undefined) throw new Error(`booking ${work.booking_id} is gone`);
+  if (booking === undefined) throw new Error(`booking ${bookingId} is gone`);
 
   if (booking.state !== 'pending_payment') return 'superseded';
 

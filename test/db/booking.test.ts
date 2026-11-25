@@ -226,7 +226,7 @@ describe('the hold-expiry sweeper', () => {
     const hold = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     const after = new Date(hold.holdExpiresAt.getTime() + 1000);
 
-    const outcomes = await sweepDueWork(db, after);
+    const outcomes = await sweepDueWork(db, null, after);
     assert.equal(outcomes.length, 1);
     assert.equal(outcomes[0]?.result, 'released');
 
@@ -252,7 +252,7 @@ describe('the hold-expiry sweeper', () => {
     // Stands in for the webhook landing first. The sweeper must notice and stand down.
     await db.query(`UPDATE bookings SET state = 'paid' WHERE id = $1`, [hold.bookingId]);
 
-    const outcomes = await sweepDueWork(db, new Date(hold.holdExpiresAt.getTime() + 1000));
+    const outcomes = await sweepDueWork(db, null, new Date(hold.holdExpiresAt.getTime() + 1000));
     assert.equal(outcomes[0]?.result, 'superseded');
 
     const { rows } = await db.query(
@@ -269,24 +269,28 @@ describe('the hold-expiry sweeper', () => {
 
   test('work that is not due yet is left alone', async () => {
     const hold = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
-    const outcomes = await sweepDueWork(db, new Date(hold.holdExpiresAt.getTime() - 1000));
+    const outcomes = await sweepDueWork(db, null, new Date(hold.holdExpiresAt.getTime() - 1000));
     assert.deepEqual(outcomes, []);
     const { rows } = await db.query('SELECT state FROM bookings WHERE id = $1', [hold.bookingId]);
     assert.equal((rows[0] as { state: string }).state, 'pending_payment');
   });
 
   test('work of a kind this poller cannot run is left queued, not marked done', async () => {
+    // `upload_grant_close` is in the due_work_kind enum and not in HANDLED_KINDS, so a
+    // row of it must be stepped over entirely: not claimed, not attempted, not marked
+    // done. Wiring that kind up later has to find its backlog waiting, and this is the
+    // only thing standing between "not implemented yet" and "silently discharged".
     const hold = await createHold(db, new FakePaymentProvider({ now: NOW }), INPUT, NOW);
     await db.query(
-      `INSERT INTO due_work (kind, booking_id, due_at) VALUES ('window_open', $1, $2)`,
+      `INSERT INTO due_work (kind, booking_id, due_at) VALUES ('upload_grant_close', $1, $2)`,
       [hold.bookingId, NOW.toISOString()],
     );
 
-    const outcomes = await sweepDueWork(db, NOW);
-    assert.deepEqual(outcomes, [], 'hold_expiry is not due, window_open is not handled');
+    const outcomes = await sweepDueWork(db, null, NOW);
+    assert.deepEqual(outcomes, [], 'hold_expiry is not due, upload_grant_close is not handled');
 
     const { rows } = await db.query(
-      `SELECT done_at, attempts FROM due_work WHERE kind = 'window_open'`,
+      `SELECT done_at, attempts FROM due_work WHERE kind = 'upload_grant_close'`,
     );
     assert.deepEqual(rows[0], { done_at: null, attempts: 0 }, 'the backlog must survive');
   });
@@ -315,7 +319,7 @@ describe('the hold-expiry sweeper', () => {
     );
 
     try {
-      const outcomes = await sweepDueWork(db, after);
+      const outcomes = await sweepDueWork(db, null, after);
       assert.deepEqual(outcomes, [], 'the row is locked, so this pass must find nothing');
       const { rows } = await db.query('SELECT state FROM bookings WHERE id = $1', [hold.bookingId]);
       assert.equal(
